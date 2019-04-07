@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::error::Error;
+use std::error::Error as _;
 use std::fmt::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,15 +16,19 @@ use hyper_tls::HttpsConnector;
 use rand::distributions::{Alphanumeric, Distribution};
 use sha1::Sha1;
 use url::percent_encoding::{EncodeSet, utf8_percent_encode};
+use url::form_urlencoded;
+
+use crate::Error;
 
 pub const REQUEST_TOKEN: &'static str = "https://api.twitter.com/oauth/request_token";
 pub const AUTHENTICATE: &'static str = "https://api.twitter.com/oauth/authenticate";
+pub const ACCESS_TOKEN: &'static str = "https://api.twitter.com/oauth/access_token";
 
 // NOTE THAT egg_mode hasn't been updated for hyper 0.12 yet
 // and that's the only reason that this module exists.
 
 pub fn request_token<'a, 'b, S: Into<String>>(con_token: &'a KeyPair, callback: S, client: &'b Client<HttpsConnector<HttpConnector>, Body>)
-                                      -> impl Future<Item=KeyPair, Error=Box<(dyn std::error::Error + Send + Sync +'b)>> {
+                                      -> impl Future<Item=KeyPair, Error=Error<'b>> {
     let header = get_header(Method::POST, REQUEST_TOKEN,
                             con_token, None, Some(callback.into()), None, None);
     let header_value = header.header_value().unwrap();
@@ -35,40 +39,68 @@ pub fn request_token<'a, 'b, S: Into<String>>(con_token: &'a KeyPair, callback: 
 
     client
         .request(request)
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
+        .map_err(|e| -> Error { Box::new(e) })
         .and_then(|response| {
+            println!("request_token status code: {}", response.status());
             let (head, body) = response.into_parts();
-            println!("CODE: {}", head.status);
             body
                 .concat2()
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
+                .map_err(|e| -> Error { Box::new(e) })
                 .map(|body| {
-                    let s = String::from_utf8(body.into_iter().collect()).unwrap();
-                    parse_tok(s).unwrap()
+                    let body_bytes: Vec<u8> = body.into_iter().collect();
+                    parse_oauth_tok(&body_bytes).unwrap()
                 })
         })
 }
 
+pub fn access_token<'a, 'b, S: Into<String>>(con_token: &'a KeyPair, access_token: &KeyPair, oauth_verifier: S, client: &'b Client<HttpsConnector<HttpConnector>, Body>)
+                                        -> impl Future<Item=KeyPair, Error=Error<'b>> {
+    let header = get_header(Method::POST, ACCESS_TOKEN, con_token,
+                            Some(access_token), None, Some(oauth_verifier.into()), None);
+    let header_value = header.header_value().unwrap();
+    let request = Request::connect::<Uri>(ACCESS_TOKEN.parse().unwrap())
+        .header(AUTHORIZATION, HeaderValue::from_str(&header_value).unwrap())
+        .method(Method::POST)
+        .body(Body::empty()).unwrap();
+    println!("requesting access token with: {:?}", request);
+    client
+        .request(request)
+        .map_err(|e| -> Error { Box::new(e) })
+        .and_then(|response| {
+            println!("access_token status code: {}", response.status());
+            let (head, body) = response.into_parts();
+            body
+                .concat2()
+                .map_err(|e| -> Error { Box::new(e) })
+                .map(|body| {
+                    let body_bytes: Vec<u8> = body.into_iter().collect();
+                    let str_body = String::from_utf8(body_bytes.clone()).unwrap();
+                    println!("access token response: {}", str_body);
+                    parse_oauth_tok(&body_bytes).unwrap()
+                })
+        })
 
-fn parse_tok(full_resp: String) -> Result<KeyPair, Box<(dyn std::error::Error + Send + Sync)>> {
-    let mut key: Option<String> = None;
-    let mut secret: Option<String> = None;
+}
 
-    for elem in full_resp.split('&') {
-        let mut kv = elem.splitn(2, '=');
-        match kv.next() {
-            Some("oauth_token") => key = kv.next().map(|s| s.to_string()),
-            Some("oauth_token_secret") => secret = kv.next().map(|s| s.to_string()),
-            Some(_) => (),
-            None => panic!(),
+fn parse_oauth_tok<'a>(full_resp: &[u8]) -> Result<KeyPair, Error<'a>> {
+    let mut parsed_key: Option<String> = None;
+    let mut parsed_secret: Option<String> = None;
+
+    for (key, value) in form_urlencoded::parse(full_resp) {
+        match key.as_ref() {
+            "oauth_token" => parsed_key = Some(value.into_owned()),
+            "oauth_token_secret" => parsed_secret = Some(value.into_owned()),
+            other => println!("{}: {}", other, value),
         }
     }
 
-    Ok(KeyPair::new(key.unwrap(), secret.unwrap()))
+    let key: Result<String, Error> =
+        parsed_key.ok_or_else(|| "Could not find oauth_token parameter".to_owned().into());
+    let secret: Result<String, Error> =
+        parsed_secret.ok_or_else(|| "Could not find oauth_token_secret parameter".to_owned().into());
+
+    Ok(KeyPair::new(key?, secret?))
 }
-// make_future(handle, request, parse_tok)
-
-
 ///With the given method parameters, return a signed OAuth header.
 fn get_header(method: Method,
               uri: &str,
