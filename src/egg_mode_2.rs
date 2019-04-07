@@ -20,9 +20,9 @@ use url::percent_encoding::{EncodeSet, utf8_percent_encode};
 pub const REQUEST_TOKEN: &'static str = "https://api.twitter.com/oauth/request_token";
 pub const AUTHENTICATE: &'static str = "https://api.twitter.com/oauth/authenticate";
 
+// NOTE THAT egg_mode hasn't been updated for hyper 0.12 yet
+// and that's the only reason that this module exists.
 
-
-/// egg_mode hasn't been updated for hyper 0.12 yet
 pub fn request_token<'a, 'b, S: Into<String>>(con_token: &'a KeyPair, callback: S, client: &'b Client<HttpsConnector<HttpConnector>, Body>)
                                       -> impl Future<Item=KeyPair, Error=Box<(dyn std::error::Error + Send + Sync +'b)>> {
     let header = get_header(Method::POST, REQUEST_TOKEN,

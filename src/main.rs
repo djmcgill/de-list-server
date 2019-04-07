@@ -1,13 +1,14 @@
 use tera::{compile_templates, Context, Tera, Value};
 use lazy_static::lazy_static;
 use hyper::{Body, Request, Response, Server, StatusCode};
-use hyper::rt::{self, Future};
+use hyper::rt::Future;
 use hyper::service::service_fn;
 use std::env;
 use egg_mode;
 use egg_mode::KeyPair;
 use hyper_tls::HttpsConnector;
 use hyper::client::{Client, HttpConnector};
+use tokio_core::reactor::Core;
 
 mod egg_mode_2;
 
@@ -50,6 +51,11 @@ fn redirect_to_twitter_authenticate(_req: Request<Body>) -> impl Future<Item=Res
         );
         response
     }))
+}
+
+// http://localhost:3000/sign-in-with-twitter?oauth_token=foo&oauth_verifier=bar
+fn accept_twitter_authentication(req: Request<Body>) -> impl Future<Item=Response<Body>, Error=Box<(dyn std::error::Error + Send + Sync + 'static)>> {
+    futures::failed("unimplemented!".to_owned().into())
 }
 
 fn main() -> Result<(), Box<std::error::Error>> {
