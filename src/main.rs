@@ -11,6 +11,9 @@ use hyper::client::{Client, HttpConnector};
 use tokio_core::reactor::Core;
 use futures::future::Either;
 use url::form_urlencoded;
+use rand::RngCore;
+use std::sync::Mutex;
+use std::collections::HashMap;
 
 mod egg_mode_2;
 
@@ -33,6 +36,12 @@ lazy_static! {
         let consumer_secret = env::var("CONSUMER_SECRET").unwrap();
         KeyPair::new(consumer_key, consumer_secret)
     };
+
+    // FIXME: just in memory for now
+    // probably shouldn't also have a single lock too
+    pub static ref OAUTH_TOKENS: Mutex<HashMap<String, KeyPair>> = {
+        Mutex::new(HashMap::new())
+    };
 }
 type Error<'a> = Box<(dyn std::error::Error + Send + Sync + 'a)>;
 const CALLBACK_URL: &'static str = "http://localhost:3000/sign-in-with-twitter";
@@ -54,6 +63,11 @@ fn not_found(req: Request<Body>) -> impl Future<Item=Response<Body>, Error=Error
 fn redirect_to_twitter_authenticate(_req: Request<Body>) -> impl Future<Item=Response<Body>, Error=Error<'static>> {
     let key_pair_future = egg_mode_2::request_token(&CONSUMER_TOKEN, CALLBACK_URL, &CLIENT_POOL);
     Box::new(key_pair_future.map(|oauth_token| {
+        {
+            let mut map = OAUTH_TOKENS.lock().unwrap();
+            map.insert(oauth_token.key.clone().into_owned(), oauth_token.clone());
+        }
+
         let redirect_url = format!("{}?oauth_token={}", egg_mode_2::AUTHENTICATE, oauth_token.key);
 
         let mut context = Context::new();
@@ -72,6 +86,7 @@ fn redirect_to_twitter_authenticate(_req: Request<Body>) -> impl Future<Item=Res
 // http://localhost:3000/sign-in-with-twitter?oauth_token=foo&oauth_verifier=bar
 fn accept_twitter_authentication(req: Request<Body>) -> impl Future<Item=Response<Body>, Error=Error<'static>> {
     println!("accept_twitter_authentication");
+
     let mut oauth_token_option = None;
     let mut oauth_verifier_option = None;
 
@@ -86,13 +101,34 @@ fn accept_twitter_authentication(req: Request<Body>) -> impl Future<Item=Respons
     }
 
     let oauth_token = oauth_token_option.unwrap();
+    println!("OAUTH_TOKEN: {}", oauth_token);
     let oauth_verifier = oauth_verifier_option.unwrap();
 
+    let oauth_keypair = {
+        let map = OAUTH_TOKENS.lock().unwrap();
+        map.get(&oauth_token).unwrap().clone()
+    };
+    println!("OAUTH_KEYPAIR: {:?}", oauth_keypair);
+
     // FIXME: need to get the keypair from redirect_to_twitter_authenticate
-    egg_mode_2::access_token(&CONSUMER_TOKEN, panic!(), oauth_verifier, &CLIENT_POOL).map(|access_token|{
+    egg_mode_2::access_token(&CONSUMER_TOKEN,
+                             &oauth_keypair,
+                             oauth_verifier,
+                             &CLIENT_POOL).and_then(|(access_token, user_id)|{
+
+
         println!("GOT ACCESS TOKEN");
-        let mut response = Response::new(Body::from(TERA.render("logged_in.html", &Context::new()).unwrap()));
-        response
+
+        egg_mode_2::get_first_75_list_owners(user_id,
+                                       &CONSUMER_TOKEN,
+                                       &access_token,
+                                       &CLIENT_POOL).map(|lists| {
+            let mut context = Context::new();
+            context.insert("list_count", &Value::String(lists.len().to_string()));
+            context.insert("removal_url", &Value::String("foo.com".to_owned()));
+            let mut response = Response::new(Body::from(TERA.render("logged_in.html", &context).unwrap()));
+            response
+        })
     })
 }
 

@@ -5,6 +5,8 @@ use std::fmt::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use egg_mode::KeyPair;
+use egg_mode::list::List;
+use egg_mode::user::TwitterUser;
 use futures::Future;
 use futures::stream::Stream;
 use hmac::{Hmac, Mac};
@@ -17,16 +19,73 @@ use rand::distributions::{Alphanumeric, Distribution};
 use sha1::Sha1;
 use url::percent_encoding::{EncodeSet, utf8_percent_encode};
 use url::form_urlencoded;
+use chrono::offset::TimeZone;
 
 use crate::Error;
 
 pub const REQUEST_TOKEN: &'static str = "https://api.twitter.com/oauth/request_token";
 pub const AUTHENTICATE: &'static str = "https://api.twitter.com/oauth/authenticate";
 pub const ACCESS_TOKEN: &'static str = "https://api.twitter.com/oauth/access_token";
+pub const MEMBERSHIPS: &'static str = "https://api.twitter.com/1.1/lists/memberships.json";
 
 // NOTE THAT egg_mode hasn't been updated for hyper 0.12 yet
 // and that's the only reason that this module exists.
 
+pub fn get_first_75_list_owners<'a, 'b, 'c>(user_id: u64,
+                    consumer_token: &'a KeyPair,
+                    access_token: &'b KeyPair,
+                    client: &'c Client<HttpsConnector<HttpConnector>, Body>
+) -> impl Future<Item=Vec<u64>, Error=Error<'c>> {
+    let uri_with_query = format!("{}?cursor=-1&user_id={}&count=75", MEMBERSHIPS, user_id);
+
+    let mut params = HashMap::new();
+    add_param(&mut params, "cursor", "-1");
+    add_param(&mut params, "user_id", user_id.to_string());
+    add_param(&mut params, "count", "75");
+
+    let header = get_header(Method::GET,
+                            MEMBERSHIPS,
+                            consumer_token,
+                            Some(access_token),
+                            None,
+                            None,
+                            Some(&params),
+    );
+    let header_value = header.header_value().unwrap();
+    let request = Request::connect::<Uri>(uri_with_query.parse().unwrap())
+        .header(AUTHORIZATION, HeaderValue::from_str(&header_value).unwrap())
+        .method(Method::GET)
+        .body(Body::empty()).unwrap();
+
+
+    client
+        .request(request)
+        .map_err(|e| -> Error { Box::new(e) })
+        .and_then(|response| {
+            println!("get_first_75_lists status code: {}", response.status());
+            let (head, body) = response.into_parts();
+            body
+                .concat2()
+                .map_err(|e| -> Error { Box::new(e) })
+                .map(|body| {
+                    parse_list_owners(body).unwrap()
+                })
+        })
+}
+
+fn parse_list_owners<'a>(body: impl IntoIterator<Item=u8> + 'a) -> Result<Vec<u64>, Error<'a>> {
+    let body_bytes: Vec<u8> = body.into_iter().collect();
+    let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    let body_obj = body_json.as_object().unwrap();
+    let lists = body_obj.get("lists").unwrap();
+    Ok(lists.as_array().unwrap().into_iter().map(|list_value| {
+        let list = list_value.as_object().unwrap();
+        let user = list.get("user").unwrap().as_object().unwrap();
+        user.get("id").unwrap().as_u64().unwrap()
+    }).collect())
+}
+
+// FIXME: ensure all tokens are alphanum only also limit length
 pub fn request_token<'a, 'b, S: Into<String>>(con_token: &'a KeyPair, callback: S, client: &'b Client<HttpsConnector<HttpConnector>, Body>)
                                       -> impl Future<Item=KeyPair, Error=Error<'b>> {
     let header = get_header(Method::POST, REQUEST_TOKEN,
@@ -48,13 +107,14 @@ pub fn request_token<'a, 'b, S: Into<String>>(con_token: &'a KeyPair, callback: 
                 .map_err(|e| -> Error { Box::new(e) })
                 .map(|body| {
                     let body_bytes: Vec<u8> = body.into_iter().collect();
+                    // oauth_callback_confirmed: true
                     parse_oauth_tok(&body_bytes).unwrap()
                 })
         })
 }
 
 pub fn access_token<'a, 'b, S: Into<String>>(con_token: &'a KeyPair, access_token: &KeyPair, oauth_verifier: S, client: &'b Client<HttpsConnector<HttpConnector>, Body>)
-                                        -> impl Future<Item=KeyPair, Error=Error<'b>> {
+                                        -> impl Future<Item=(KeyPair, u64), Error=Error<'b>> {
     let header = get_header(Method::POST, ACCESS_TOKEN, con_token,
                             Some(access_token), None, Some(oauth_verifier.into()), None);
     let header_value = header.header_value().unwrap();
@@ -76,10 +136,36 @@ pub fn access_token<'a, 'b, S: Into<String>>(con_token: &'a KeyPair, access_toke
                     let body_bytes: Vec<u8> = body.into_iter().collect();
                     let str_body = String::from_utf8(body_bytes.clone()).unwrap();
                     println!("access token response: {}", str_body);
-                    parse_oauth_tok(&body_bytes).unwrap()
+//                    user_id: 111111111
+//                    screen_name: foobar
+                    parse_oauth_tok_and_user_id(&body_bytes).unwrap()
                 })
         })
 
+}
+
+fn parse_oauth_tok_and_user_id<'a>(full_resp: &[u8]) -> Result<(KeyPair, u64), Error<'a>> {
+    let mut parsed_key: Option<String> = None;
+    let mut parsed_secret: Option<String> = None;
+    let mut parsed_user_id: Option<u64> = None;
+
+    for (key, value) in form_urlencoded::parse(full_resp) {
+        match key.as_ref() {
+            "oauth_token" => parsed_key = Some(value.into_owned()),
+            "oauth_token_secret" => parsed_secret = Some(value.into_owned()),
+            "user_id" => parsed_user_id = Some(value.parse::<u64>().unwrap()),
+            other => println!("{}: {}", other, value),
+        }
+    }
+
+    let key: Result<String, Error> =
+        parsed_key.ok_or_else(|| "Could not find oauth_token parameter".to_owned().into());
+    let secret: Result<String, Error> =
+        parsed_secret.ok_or_else(|| "Could not find oauth_token_secret parameter".to_owned().into());
+    let user_id: Result<u64, Error> =
+        parsed_user_id.ok_or_else(|| "Could not find (or parse) user_id parameter".to_owned().into());
+
+    Ok((KeyPair::new(key?, secret?), user_id?))
 }
 
 fn parse_oauth_tok<'a>(full_resp: &[u8]) -> Result<KeyPair, Error<'a>> {
