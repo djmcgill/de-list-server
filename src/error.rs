@@ -38,4 +38,3 @@ pub trait Future01Ext<S, E: Fail>: Sized + futures01::Future<Item = S, Error = E
 }
 
 impl<S, E: Fail, F: futures01::Future<Item = S, Error = E>> Future01Ext<S, E> for F {}
-

@@ -3,9 +3,12 @@
 use egg_mode;
 use egg_mode::KeyPair;
 use failure::Fail;
-use futures01::future::Either;
+use futures::compat::Future01CompatExt;
+use futures::future::{FutureExt, TryFutureExt};
+use futures::Future;
+use futures01::future::Either as Either01;
 use hyper::client::{Client, HttpConnector};
-use hyper::rt::Future;
+use hyper::rt::Future as Future01;
 use hyper::service::service_fn;
 use hyper::{Body, Method, Request, Response, Server, StatusCode};
 use hyper_tls::HttpsConnector;
@@ -14,6 +17,7 @@ use std::collections::HashMap;
 use std::env;
 use std::sync::Mutex;
 use tera::{compile_templates, Context, Tera, Value};
+use tide::response::IntoResponse;
 use tokio_core::reactor::Core;
 use url::form_urlencoded;
 
@@ -48,36 +52,15 @@ lazy_static! {
 }
 const CALLBACK_URL: &'static str = "http://localhost:3000/sign-in-with-twitter";
 
-fn routes_compat(
-    req: Request<Body>,
-) -> impl Future<Item = Response<Body>, Error = Box<(dyn std::error::Error + Send + Sync + 'static)>>
-{
-    routes(req).map_err(
-        |e| -> Box<(dyn std::error::Error + Send + Sync + 'static)> { Box::new(e.compat()) },
-    )
-}
-
-fn routes(req: Request<Body>) -> impl Future<Item = Response<Body>, Error = error::Error> {
-    match (req.method(), req.uri().path()) {
-        // FIXME: make this a macro
-        (&Method::GET, "/") => Either::A(Either::A(redirect_to_twitter_authenticate(req))),
-        (&Method::GET, "/sign-in-with-twitter") => {
-            Either::A(Either::B(accept_twitter_authentication(req)))
-        }
-        _ => Either::B(not_found(req)),
-    }
-}
-
-fn not_found(req: Request<Body>) -> impl Future<Item = Response<Body>, Error = error::Error> {
-    println!("Not found: {}", req.uri().path());
-    futures01::failed(
-        error::ErrorKind::OtherError("'not_found' is unimplemented!".to_owned()).into(),
-    )
+fn redirect_to_twitter_authenticate_3(
+    context: tide::Context<()>,
+) -> impl futures::Future<Output = Result<Response<http_service::Body>, error::Error>> {
+    redirect_to_twitter_authenticate(context.request()).compat()
 }
 
 fn redirect_to_twitter_authenticate(
-    _req: Request<Body>,
-) -> impl Future<Item = Response<Body>, Error = error::Error> {
+    _req: &Request<http_service::Body>,
+) -> impl Future01<Item = Response<http_service::Body>, Error = error::Error> {
     let key_pair_future = egg_mode_2::request_token(&CONSUMER_TOKEN, CALLBACK_URL, &CLIENT_POOL);
     Box::new(key_pair_future.map(|oauth_token| {
         {
@@ -94,8 +77,9 @@ fn redirect_to_twitter_authenticate(
         let mut context = Context::new();
         context.insert("redirect_url", &Value::String(redirect_url.clone()));
 
-        let mut response =
-            Response::new(Body::from(TERA.render("redirect.html", &context).unwrap()));
+        let mut response = Response::new(http_service::Body::from(
+            TERA.render("redirect.html", &context).unwrap(),
+        ));
         *response.status_mut() = StatusCode::from_u16(302).unwrap();
         response.headers_mut().insert(
             hyper::header::LOCATION,
@@ -105,10 +89,16 @@ fn redirect_to_twitter_authenticate(
     }))
 }
 
+fn accept_twitter_authentication_3(
+    context: tide::Context<()>,
+) -> impl futures::Future<Output = Result<Response<http_service::Body>, error::Error>> {
+    accept_twitter_authentication(context.request()).compat()
+}
+
 // http://localhost:3000/sign-in-with-twitter?oauth_token=foo&oauth_verifier=bar
 fn accept_twitter_authentication(
-    req: Request<Body>,
-) -> impl Future<Item = Response<Body>, Error = error::Error> {
+    req: &Request<http_service::Body>,
+) -> impl Future01<Item = Response<http_service::Body>, Error = error::Error> {
     println!("accept_twitter_authentication");
 
     let mut oauth_token_option = None;
@@ -141,10 +131,6 @@ fn accept_twitter_authentication(
         oauth_verifier,
         &CLIENT_POOL,
     )
-    .map_err(|_e| {
-        let kind = error::ErrorKind::OtherError("bax".to_owned());
-        kind.into()
-    })
     .and_then(|(access_token, user_id)| {
         println!("GOT ACCESS TOKEN");
 
@@ -158,28 +144,36 @@ fn accept_twitter_authentication(
             let mut context = Context::new();
             context.insert("list_count", &Value::String(lists.len().to_string()));
             context.insert("removal_url", &Value::String("foo.com".to_owned()));
-            let response =
-                Response::new(Body::from(TERA.render("logged_in.html", &context).unwrap()));
+            let response = Response::new(http_service::Body::from(
+                TERA.render("logged_in.html", &context).unwrap(),
+            ));
             response
         })
     })
 }
 
-fn main() -> Result<(), Box<std::error::Error>> {
+fn or_internal_service_error<T>(
+    fut: impl Future<Output = Result<T, error::Error>>,
+) -> impl Future<Output = Result<T, Response<http_service::Body>>> {
+    fut.map_err(|e| {
+        log::error!("Unhandled error: {:?}", e);
+        let mut response = Response::new(http_service::Body::from(
+            "Internal Server Error: unhandled exception",
+        ));
+        *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+        response
+    })
+}
+
+fn main() -> std::io::Result<()> {
     env_logger::init();
 
-    let mut core = Core::new().unwrap();
+    let mut app = tide::App::new(());
 
-    let addr = ([127, 0, 0, 1], 3000).into();
+    app.at("/")
+        .get(|c| or_internal_service_error(redirect_to_twitter_authenticate_3(c)));
+    app.at("/sign-in-with-twitter")
+        .get(|c| or_internal_service_error(accept_twitter_authentication_3(c)));
 
-    let server = Server::bind(&addr)
-        .serve(|| service_fn(routes_compat))
-        .map_err(|e| {
-            eprintln!("server error: {}", e);
-            e
-        });
-
-    println!("Listening on http://{}", addr);
-    core.run(server)?;
-    Ok(())
+    app.serve("127.0.0.1:3000")
 }
