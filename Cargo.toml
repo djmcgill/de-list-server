@@ -27,6 +27,7 @@ failchain = "0.1015.2"
 failure = "0.1.5"
 tide = "0.1.1"
 http-service = "0.1.5"
+http = "0.1.17"
 
 [dependencies.rusqlite]
 version = "0.17.0"

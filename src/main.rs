@@ -2,23 +2,19 @@
 
 use egg_mode;
 use egg_mode::KeyPair;
-use failure::Fail;
+use failchain::ResultExt;
 use futures::compat::Future01CompatExt;
 use futures::future::{FutureExt, TryFutureExt};
 use futures::Future;
-use futures01::future::Either as Either01;
 use hyper::client::{Client, HttpConnector};
 use hyper::rt::Future as Future01;
-use hyper::service::service_fn;
-use hyper::{Body, Method, Request, Response, Server, StatusCode};
+use hyper::{Request, Response, StatusCode};
 use hyper_tls::HttpsConnector;
 use lazy_static::lazy_static;
 use std::collections::HashMap;
 use std::env;
 use std::sync::Mutex;
 use tera::{compile_templates, Context, Tera, Value};
-use tide::response::IntoResponse;
-use tokio_core::reactor::Core;
 use url::form_urlencoded;
 
 mod egg_mode_2;
@@ -52,41 +48,42 @@ lazy_static! {
 }
 const CALLBACK_URL: &'static str = "http://localhost:3000/sign-in-with-twitter";
 
-fn redirect_to_twitter_authenticate_3(
-    context: tide::Context<()>,
-) -> impl futures::Future<Output = Result<Response<http_service::Body>, error::Error>> {
-    redirect_to_twitter_authenticate(context.request()).compat()
+fn save_oauth_token(oauth_token: &KeyPair) {
+    let mut map = OAUTH_TOKENS.lock().unwrap();
+    map.insert(oauth_token.key.clone().into_owned(), oauth_token.clone());
+}
+
+fn redirect_to(redirect_url: &str) -> Result<Response<http_service::Body>, error::Error> {
+    let mut response = Response::new(http_service::Body::empty());
+    *response.status_mut() = StatusCode::FOUND;
+
+    let header_value = hyper::header::HeaderValue::from_str(&redirect_url).chain_err(|| {
+        error::ErrorKind::OtherError("constructing header value from redirect url".to_owned())
+    })?;
+    response
+        .headers_mut()
+        .insert(hyper::header::LOCATION, header_value);
+    Ok(response)
 }
 
 fn redirect_to_twitter_authenticate(
-    _req: &Request<http_service::Body>,
-) -> impl Future01<Item = Response<http_service::Body>, Error = error::Error> {
-    let key_pair_future = egg_mode_2::request_token(&CONSUMER_TOKEN, CALLBACK_URL, &CLIENT_POOL);
-    Box::new(key_pair_future.map(|oauth_token| {
-        {
-            let mut map = OAUTH_TOKENS.lock().unwrap();
-            map.insert(oauth_token.key.clone().into_owned(), oauth_token.clone());
-        }
+    _context: tide::Context<()>,
+) -> impl futures::Future<Output = Result<Response<http_service::Body>, error::Error>> {
+    let key_pair_future =
+        egg_mode_2::request_token(&CONSUMER_TOKEN, CALLBACK_URL, &CLIENT_POOL).compat();
+    key_pair_future.map(|try_oauth_token| {
+        try_oauth_token.and_then(|oauth_token| {
+            save_oauth_token(&oauth_token);
 
-        let redirect_url = format!(
-            "{}?oauth_token={}",
-            egg_mode_2::AUTHENTICATE,
-            oauth_token.key
-        );
+            let redirect_url = format!(
+                "{}?oauth_token={}",
+                egg_mode_2::AUTHENTICATE,
+                oauth_token.key
+            );
 
-        let mut context = Context::new();
-        context.insert("redirect_url", &Value::String(redirect_url.clone()));
-
-        let mut response = Response::new(http_service::Body::from(
-            TERA.render("redirect.html", &context).unwrap(),
-        ));
-        *response.status_mut() = StatusCode::from_u16(302).unwrap();
-        response.headers_mut().insert(
-            hyper::header::LOCATION,
-            hyper::header::HeaderValue::from_str(&redirect_url).unwrap(),
-        );
-        response
-    }))
+            redirect_to(&redirect_url)
+        })
+    })
 }
 
 fn accept_twitter_authentication_3(
@@ -171,7 +168,7 @@ fn main() -> std::io::Result<()> {
     let mut app = tide::App::new(());
 
     app.at("/")
-        .get(|c| or_internal_service_error(redirect_to_twitter_authenticate_3(c)));
+        .get(|c| or_internal_service_error(redirect_to_twitter_authenticate(c)));
     app.at("/sign-in-with-twitter")
         .get(|c| or_internal_service_error(accept_twitter_authentication_3(c)));
 
