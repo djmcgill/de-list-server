@@ -1,15 +1,13 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
-use std::error::Error as _;
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::result::Result as StdResult;
+use std::error::Error as _;
 
-use egg_mode::list::List;
-use egg_mode::user::TwitterUser;
 use egg_mode::KeyPair;
 use futures::compat::Future01CompatExt;
 use futures::Future;
-use futures::{FutureExt, TryFutureExt};
 use futures01::stream::Stream;
 use futures01::Future as Future01;
 use hmac::{Hmac, Mac};
@@ -25,6 +23,9 @@ use std::collections::BTreeSet;
 use std::iter::FromIterator;
 use url::form_urlencoded;
 use url::percent_encoding::{utf8_percent_encode, EncodeSet};
+use crate::error::*;
+use failchain::ResultExt;
+use failure::Fail;
 
 #[derive(Deserialize)]
 struct TwitterUserId {
@@ -39,7 +40,7 @@ struct ListMembership {
     lists: Vec<TwitterList>,
 }
 
-use crate::Error;
+
 
 pub const REQUEST_TOKEN: &'static str = "https://api.twitter.com/oauth/request_token";
 pub const AUTHENTICATE: &'static str = "https://api.twitter.com/oauth/authenticate";
@@ -49,20 +50,20 @@ pub const MEMBERSHIPS: &'static str = "https://api.twitter.com/1.1/lists/members
 // NOTE THAT egg_mode hasn't been updated for hyper 0.12 yet
 // and that's the only reason that this module exists.
 
-pub fn get_owners_compat<'c>(
+pub fn get_owners_compat(
     user_id: u64,
     consumer_token: &KeyPair,
     access_token: &KeyPair,
-    client: &'c Client<HttpsConnector<HttpConnector>, Body>,
-) -> impl Future<Output = Result<Vec<u64>, Error<'c>>> {
+    client: &Client<HttpsConnector<HttpConnector>, Body>,
+) -> impl Future<Output = Result<Vec<u64>>> {
     get_owners_of_first_75_lists(user_id, consumer_token, access_token, client).compat()
 }
-pub fn get_owners_of_first_75_lists<'a, 'b, 'c>(
+pub fn get_owners_of_first_75_lists(
     user_id: u64,
-    consumer_token: &'a KeyPair,
-    access_token: &'b KeyPair,
-    client: &'c Client<HttpsConnector<HttpConnector>, Body>,
-) -> impl Future01<Item = Vec<u64>, Error = Error<'c>> {
+    consumer_token: &KeyPair,
+    access_token: &KeyPair,
+    client: &Client<HttpsConnector<HttpConnector>, Body>,
+) -> impl Future01<Item = Vec<u64>, Error = Error> {
     let uri_with_query = format!("{}?cursor=-1&user_id={}&count=75", MEMBERSHIPS, user_id);
 
     let mut params = HashMap::new();
@@ -88,39 +89,46 @@ pub fn get_owners_of_first_75_lists<'a, 'b, 'c>(
 
     client
         .request(request)
-        .map_err(|e| -> Error { Box::new(e) })
+        .map_err(|e| {
+            let kind = ErrorKind::OtherError("foo".to_owned());
+            e.context(kind).into()
+        })
         .and_then(|response| {
             println!("get_first_75_lists status code: {}", response.status());
-            let (head, body) = response.into_parts();
+            let (_head, body) = response.into_parts();
             body.concat2()
-                .map_err(|e| -> Error { Box::new(e) })
+                .map_err(|e| {
+                    let kind = ErrorKind::OtherError("bar".to_owned());
+                    e.context(kind).into()
+                })
                 .map(|body| parse_list_owners(body).unwrap().take(75).collect())
         })
 }
 
-fn parse_list_owners<'a>(
-    body: impl IntoIterator<Item = u8> + 'a,
-) -> Result<impl Iterator<Item = u64>, Error<'a>> {
+fn parse_list_owners(
+    body: impl IntoIterator<Item = u8>,
+) -> Result<impl Iterator<Item = u64>> {
     let body_bytes: Vec<u8> = body.into_iter().collect();
-    let body_json: ListMembership = serde_json::from_slice(&body_bytes)?;
+    let body_json: ListMembership = serde_json::from_slice(&body_bytes)
+        .chain_err(|| ErrorKind::JsonParseError("Parsing list memberships".to_owned()))?;
     let list_owners_iter = body_json.lists.into_iter().map(|json| json.user.id);
     Ok(BTreeSet::from_iter(list_owners_iter).into_iter())
 }
 
-pub fn request_token_compat<'a>(
+pub fn request_token_compat(
     con_token: &KeyPair,
     callback: impl Into<String>,
-    client: &'a Client<HttpsConnector<HttpConnector>, Body>,
-) -> impl Future<Output = Result<KeyPair, Error<'a>>> {
+    client: &Client<HttpsConnector<HttpConnector>, Body>,
+) -> impl Future<Output = Result<KeyPair>> {
     request_token(con_token, callback, client).compat()
 }
 
 // FIXME: ensure all tokens are alphanum only also limit length
-pub fn request_token<'a, 'b, S: Into<String>>(
-    con_token: &'a KeyPair,
-    callback: S,
-    client: &'b Client<HttpsConnector<HttpConnector>, Body>,
-) -> impl Future01<Item = KeyPair, Error = Error<'b>> {
+pub fn request_token(
+    con_token: &KeyPair,
+    callback: impl Into<String>,
+    client: &Client<HttpsConnector<HttpConnector>, Body>,
+) -> impl Future01<Item = KeyPair, Error = Error> {
     let header = get_header(
         Method::POST,
         REQUEST_TOKEN,
@@ -139,12 +147,18 @@ pub fn request_token<'a, 'b, S: Into<String>>(
 
     client
         .request(request)
-        .map_err(|e| -> Error { Box::new(e) })
+        .map_err(|e| {
+            let kind = ErrorKind::OtherError("foo".to_owned());
+            e.context(kind).into()
+        })
         .and_then(|response| {
             println!("request_token status code: {}", response.status());
-            let (head, body) = response.into_parts();
+            let (_head, body) = response.into_parts();
             body.concat2()
-                .map_err(|e| -> Error { Box::new(e) })
+                .map_err(|e| {
+                    let kind = ErrorKind::OtherError("foo".to_owned());
+                    e.context(kind).into()
+                })
                 .map(|body| {
                     let body_bytes: Vec<u8> = body.into_iter().collect();
                     // oauth_callback_confirmed: true
@@ -153,21 +167,21 @@ pub fn request_token<'a, 'b, S: Into<String>>(
         })
 }
 
-pub fn access_token_compat<'a>(
+pub fn access_token_compat(
     con_token: &KeyPair,
     access_token_kp: &KeyPair,
     oauth_verifier: impl Into<String>,
-    client: &'a Client<HttpsConnector<HttpConnector>, Body>,
-) -> impl Future<Output=Result<(KeyPair, u64), Error<'a>>> {
+    client: &Client<HttpsConnector<HttpConnector>, Body>,
+) -> impl Future<Output = Result<(KeyPair, u64)>> {
     access_token(con_token, access_token_kp, oauth_verifier, client).compat()
 }
 
-pub fn access_token<'a, 'b, S: Into<String>>(
-    con_token: &'a KeyPair,
+pub fn access_token(
+    con_token: &KeyPair,
     access_token: &KeyPair,
-    oauth_verifier: S,
-    client: &'b Client<HttpsConnector<HttpConnector>, Body>,
-) -> impl Future01<Item = (KeyPair, u64), Error = Error<'b>> {
+    oauth_verifier: impl Into<String>,
+    client: &Client<HttpsConnector<HttpConnector>, Body>,
+) -> impl Future01<Item = (KeyPair, u64), Error = Error> {
     let header = get_header(
         Method::POST,
         ACCESS_TOKEN,
@@ -186,12 +200,18 @@ pub fn access_token<'a, 'b, S: Into<String>>(
     println!("requesting access token with: {:?}", request);
     client
         .request(request)
-        .map_err(|e| -> Error { Box::new(e) })
+        .map_err(|e| {
+            let kind = ErrorKind::OtherError("foo".to_owned());
+            e.context(kind).into()
+        })
         .and_then(|response| {
             println!("access_token status code: {}", response.status());
-            let (head, body) = response.into_parts();
+            let (_head, body) = response.into_parts();
             body.concat2()
-                .map_err(|e| -> Error { Box::new(e) })
+                .map_err(|e| {
+                    let kind = ErrorKind::OtherError("foo".to_owned());
+                    e.context(kind).into()
+                })
                 .map(|body| {
                     let body_bytes: Vec<u8> = body.into_iter().collect();
                     let str_body = String::from_utf8(body_bytes.clone()).unwrap();
@@ -203,7 +223,7 @@ pub fn access_token<'a, 'b, S: Into<String>>(
         })
 }
 
-fn parse_oauth_tok_and_user_id<'a>(full_resp: &[u8]) -> Result<(KeyPair, u64), Error<'a>> {
+fn parse_oauth_tok_and_user_id(full_resp: &[u8]) -> Result<(KeyPair, u64)> {
     let mut parsed_key: Option<String> = None;
     let mut parsed_secret: Option<String> = None;
     let mut parsed_user_id: Option<u64> = None;
@@ -217,23 +237,22 @@ fn parse_oauth_tok_and_user_id<'a>(full_resp: &[u8]) -> Result<(KeyPair, u64), E
         }
     }
 
-    let key: Result<String, Error> =
-        parsed_key.ok_or_else(|| "Could not find oauth_token parameter".to_owned().into());
-    let secret: Result<String, Error> = parsed_secret.ok_or_else(|| {
-        "Could not find oauth_token_secret parameter"
-            .to_owned()
+    let key: Result<String> = parsed_key.ok_or_else(|| {
+        ErrorKind::OtherError("Could not find oauth_token parameter".to_owned()).into()
+    });
+    let secret: Result<String> = parsed_secret.ok_or_else(|| {
+        ErrorKind::OtherError("Could not find oauth_token_secret parameter".to_owned())
             .into()
     });
-    let user_id: Result<u64, Error> = parsed_user_id.ok_or_else(|| {
-        "Could not find (or parse) user_id parameter"
-            .to_owned()
+    let user_id: Result<u64> = parsed_user_id.ok_or_else(|| {
+        ErrorKind::OtherError("Could not find (or parse) user_id parameter".to_owned())
             .into()
     });
 
     Ok((KeyPair::new(key?, secret?), user_id?))
 }
 
-fn parse_oauth_tok<'a>(full_resp: &[u8]) -> Result<KeyPair, Error<'a>> {
+fn parse_oauth_tok(full_resp: &[u8]) -> Result<KeyPair> {
     let mut parsed_key: Option<String> = None;
     let mut parsed_secret: Option<String> = None;
 
@@ -245,11 +264,11 @@ fn parse_oauth_tok<'a>(full_resp: &[u8]) -> Result<KeyPair, Error<'a>> {
         }
     }
 
-    let key: Result<String, Error> =
-        parsed_key.ok_or_else(|| "Could not find oauth_token parameter".to_owned().into());
-    let secret: Result<String, Error> = parsed_secret.ok_or_else(|| {
-        "Could not find oauth_token_secret parameter"
-            .to_owned()
+    let key: Result<String> = parsed_key.ok_or_else(|| {
+        ErrorKind::OtherError("Could not find oauth_token parameter".to_owned()).into()
+    });
+    let secret: Result<String> = parsed_secret.ok_or_else(|| {
+        ErrorKind::OtherError("Could not find oauth_token_secret parameter".to_owned())
             .into()
     });
 
@@ -400,7 +419,7 @@ struct TwitterOAuth {
 impl std::str::FromStr for TwitterOAuth {
     type Err = String;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+    fn from_str(s: &str) -> StdResult<Self, Self::Err> {
         let mut consumer_key: Option<String> = None;
         let mut nonce: Option<String> = None;
         let mut signature: Option<String> = None;
@@ -443,7 +462,7 @@ impl std::str::FromStr for TwitterOAuth {
 }
 
 impl TwitterOAuth {
-    fn header_value(&self) -> Result<String, std::fmt::Error> {
+    fn header_value(&self) -> StdResult<String, std::fmt::Error> {
         let mut ret = String::new();
         write!(ret, "OAuth ")?;
 

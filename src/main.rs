@@ -1,7 +1,8 @@
-#![feature(futures_api)]
+#![feature(futures_api, async_await, await_macro)]
 
 use egg_mode;
 use egg_mode::KeyPair;
+use failure::Fail;
 use futures01::future::Either;
 use hyper::client::{Client, HttpConnector};
 use hyper::rt::Future;
@@ -9,7 +10,6 @@ use hyper::service::service_fn;
 use hyper::{Body, Method, Request, Response, Server, StatusCode};
 use hyper_tls::HttpsConnector;
 use lazy_static::lazy_static;
-use rand::RngCore;
 use std::collections::HashMap;
 use std::env;
 use std::sync::Mutex;
@@ -18,6 +18,7 @@ use tokio_core::reactor::Core;
 use url::form_urlencoded;
 
 mod egg_mode_2;
+mod error;
 
 lazy_static! {
     pub static ref TERA: Tera = {
@@ -45,10 +46,18 @@ lazy_static! {
         Mutex::new(HashMap::new())
     };
 }
-type Error<'a> = Box<(dyn std::error::Error + Send + Sync + 'a)>;
 const CALLBACK_URL: &'static str = "http://localhost:3000/sign-in-with-twitter";
 
-fn routes(req: Request<Body>) -> impl Future<Item = Response<Body>, Error = Error<'static>> {
+fn routes_compat(
+    req: Request<Body>,
+) -> impl Future<Item = Response<Body>, Error = Box<(dyn std::error::Error + Send + Sync + 'static)>>
+{
+    routes(req).map_err(
+        |e| -> Box<(dyn std::error::Error + Send + Sync + 'static)> { Box::new(e.compat()) },
+    )
+}
+
+fn routes(req: Request<Body>) -> impl Future<Item = Response<Body>, Error = error::Error> {
     match (req.method(), req.uri().path()) {
         // FIXME: make this a macro
         (&Method::GET, "/") => Either::A(Either::A(redirect_to_twitter_authenticate(req))),
@@ -59,14 +68,16 @@ fn routes(req: Request<Body>) -> impl Future<Item = Response<Body>, Error = Erro
     }
 }
 
-fn not_found(req: Request<Body>) -> impl Future<Item = Response<Body>, Error = Error<'static>> {
+fn not_found(req: Request<Body>) -> impl Future<Item = Response<Body>, Error = error::Error> {
     println!("Not found: {}", req.uri().path());
-    futures01::failed("'not_found' is unimplemented!".to_owned().into())
+    futures01::failed(
+        error::ErrorKind::OtherError("'not_found' is unimplemented!".to_owned()).into(),
+    )
 }
 
 fn redirect_to_twitter_authenticate(
     _req: Request<Body>,
-) -> impl Future<Item = Response<Body>, Error = Error<'static>> {
+) -> impl Future<Item = Response<Body>, Error = error::Error> {
     let key_pair_future = egg_mode_2::request_token(&CONSUMER_TOKEN, CALLBACK_URL, &CLIENT_POOL);
     Box::new(key_pair_future.map(|oauth_token| {
         {
@@ -97,7 +108,7 @@ fn redirect_to_twitter_authenticate(
 // http://localhost:3000/sign-in-with-twitter?oauth_token=foo&oauth_verifier=bar
 fn accept_twitter_authentication(
     req: Request<Body>,
-) -> impl Future<Item = Response<Body>, Error = Error<'static>> {
+) -> impl Future<Item = Response<Body>, Error = error::Error> {
     println!("accept_twitter_authentication");
 
     let mut oauth_token_option = None;
@@ -130,6 +141,10 @@ fn accept_twitter_authentication(
         oauth_verifier,
         &CLIENT_POOL,
     )
+    .map_err(|_e| {
+        let kind = error::ErrorKind::OtherError("bax".to_owned());
+        kind.into()
+    })
     .and_then(|(access_token, user_id)| {
         println!("GOT ACCESS TOKEN");
 
@@ -143,7 +158,7 @@ fn accept_twitter_authentication(
             let mut context = Context::new();
             context.insert("list_count", &Value::String(lists.len().to_string()));
             context.insert("removal_url", &Value::String("foo.com".to_owned()));
-            let mut response =
+            let response =
                 Response::new(Body::from(TERA.render("logged_in.html", &context).unwrap()));
             response
         })
@@ -158,7 +173,7 @@ fn main() -> Result<(), Box<std::error::Error>> {
     let addr = ([127, 0, 0, 1], 3000).into();
 
     let server = Server::bind(&addr)
-        .serve(|| service_fn(routes))
+        .serve(|| service_fn(routes_compat))
         .map_err(|e| {
             eprintln!("server error: {}", e);
             e
