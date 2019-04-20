@@ -6,6 +6,7 @@ use failchain::ResultExt;
 use futures::compat::Future01CompatExt;
 use futures::future::{FutureExt, TryFutureExt};
 use futures::Future;
+use http::Uri;
 use hyper::client::{Client, HttpConnector};
 use hyper::rt::Future as Future01;
 use hyper::{Request, Response, StatusCode};
@@ -71,6 +72,7 @@ fn redirect_to_twitter_authenticate(
 ) -> impl futures::Future<Output = Result<Response<http_service::Body>, error::Error>> {
     let key_pair_future =
         egg_mode_2::request_token(&CONSUMER_TOKEN, CALLBACK_URL, &CLIENT_POOL).compat();
+
     key_pair_future.map(|try_oauth_token| {
         try_oauth_token.and_then(|oauth_token| {
             save_oauth_token(&oauth_token);
@@ -92,16 +94,11 @@ fn accept_twitter_authentication_3(
     accept_twitter_authentication(context.request()).compat()
 }
 
-// http://localhost:3000/sign-in-with-twitter?oauth_token=foo&oauth_verifier=bar
-fn accept_twitter_authentication(
-    req: &Request<http_service::Body>,
-) -> impl Future01<Item = Response<http_service::Body>, Error = error::Error> {
-    println!("accept_twitter_authentication");
-
+fn parse_oauth_token_and_verifier(uri: &Uri) -> Result<(String, String), error::Error> {
     let mut oauth_token_option = None;
     let mut oauth_verifier_option = None;
 
-    for query in req.uri().query() {
+    for query in uri.query() {
         for (key, value) in form_urlencoded::parse(query.as_bytes()) {
             match key.as_ref() {
                 "oauth_token" => oauth_token_option = Some(value.into_owned()),
@@ -111,9 +108,23 @@ fn accept_twitter_authentication(
         }
     }
 
-    let oauth_token = oauth_token_option.unwrap();
-    println!("OAUTH_TOKEN: {}", oauth_token);
-    let oauth_verifier = oauth_verifier_option.unwrap();
+    let oauth_token =
+        oauth_token_option.ok_or_else(|| error::ErrorKind::OtherError("".to_owned().into()));
+    let oauth_verifier =
+        oauth_verifier_option.ok_or_else(|| error::ErrorKind::OtherError("".to_owned().into()));
+    Ok((oauth_token?, oauth_verifier?))
+}
+
+// http://localhost:3000/sign-in-with-twitter?oauth_token=foo&oauth_verifier=bar
+fn accept_twitter_authentication(
+    req: &Request<http_service::Body>,
+) -> impl Future01<Item = Response<http_service::Body>, Error = error::Error> {
+    log::trace!("accept_twitter_authentication");
+
+    let (oauth_token, oauth_verifier) = match parse_oauth_token_and_verifier(req.uri()) {
+        Ok(x) => x,
+        Err(e) => return futures01::future::Either::A(futures01::failed(e)),
+    };
 
     let oauth_keypair = {
         let map = OAUTH_TOKENS.lock().unwrap();
@@ -122,7 +133,7 @@ fn accept_twitter_authentication(
     println!("OAUTH_KEYPAIR: {:?}", oauth_keypair);
 
     // FIXME: need to get the keypair from redirect_to_twitter_authenticate
-    egg_mode_2::access_token(
+    let fut = egg_mode_2::access_token(
         &CONSUMER_TOKEN,
         &oauth_keypair,
         oauth_verifier,
@@ -146,7 +157,8 @@ fn accept_twitter_authentication(
             ));
             response
         })
-    })
+    });
+    futures01::future::Either::B(fut)
 }
 
 fn or_internal_service_error<T>(
