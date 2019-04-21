@@ -8,7 +8,6 @@ use futures::future::{FutureExt, TryFutureExt};
 use futures::Future;
 use http::Uri;
 use hyper::client::{Client, HttpConnector};
-use hyper::rt::Future as Future01;
 use hyper::{Request, Response, StatusCode};
 use hyper_tls::HttpsConnector;
 use lazy_static::lazy_static;
@@ -54,7 +53,7 @@ fn save_oauth_token(oauth_token: &KeyPair) {
     map.insert(oauth_token.key.clone().into_owned(), oauth_token.clone());
 }
 
-fn redirect_to(redirect_url: &str) -> Result<Response<http_service::Body>, error::Error> {
+fn redirect_response(redirect_url: &str) -> Result<Response<http_service::Body>, error::Error> {
     let mut response = Response::new(http_service::Body::empty());
     *response.status_mut() = StatusCode::FOUND;
 
@@ -83,15 +82,9 @@ fn redirect_to_twitter_authenticate(
                 oauth_token.key
             );
 
-            redirect_to(&redirect_url)
+            redirect_response(&redirect_url)
         })
     })
-}
-
-fn accept_twitter_authentication_3(
-    context: tide::Context<()>,
-) -> impl futures::Future<Output = Result<Response<http_service::Body>, error::Error>> {
-    accept_twitter_authentication(context.request()).compat()
 }
 
 fn parse_oauth_token_and_verifier(uri: &Uri) -> Result<(String, String), error::Error> {
@@ -115,50 +108,67 @@ fn parse_oauth_token_and_verifier(uri: &Uri) -> Result<(String, String), error::
     Ok((oauth_token?, oauth_verifier?))
 }
 
-// http://localhost:3000/sign-in-with-twitter?oauth_token=foo&oauth_verifier=bar
-fn accept_twitter_authentication(
-    req: &Request<http_service::Body>,
-) -> impl Future01<Item = Response<http_service::Body>, Error = error::Error> {
+fn get_oauth_keypair(oauth_token: &str) -> error::Result<KeyPair> {
+    let map = OAUTH_TOKENS.lock().map_err(|e| -> error::Error {
+        let kind = error::ErrorKind::OtherError("Could not get lock for OAUTH_TOKENS".to_owned());
+        kind.into()
+    })?;
+    let keypair = map.get(oauth_token).ok_or_else(|| -> error::Error {
+        let kind =
+            error::ErrorKind::OtherError("Did not find oauth token in tokens map".to_owned());
+        kind.into()
+    })?;
+    Ok(keypair.clone())
+}
+
+fn logged_in_response(
+    list_count: usize,
+    removal_url: &str,
+) -> error::Result<Response<http_service::Body>> {
+    let mut context = Context::new();
+    context.insert("list_count", &Value::String(list_count.to_string()));
+    context.insert("removal_url", &Value::String(removal_url.to_owned()));
+    let response = Response::new(http_service::Body::from(
+        TERA.render("logged_in.html", &context).unwrap(),
+    ));
+    Ok(response)
+}
+
+fn accept_twitter_authentication_3(
+    context: tide::Context<()>,
+) -> impl futures::Future<Output = Result<Response<http_service::Body>, error::Error>> {
     log::trace!("accept_twitter_authentication");
 
-    let (oauth_token, oauth_verifier) = match parse_oauth_token_and_verifier(req.uri()) {
+    let (oauth_token, oauth_verifier) = match parse_oauth_token_and_verifier(context.uri()) {
         Ok(x) => x,
-        Err(e) => return futures01::future::Either::A(futures01::failed(e)),
+        Err(e) => panic!(),
+        // return futures01::future::Either::A(futures01::failed(e)),
     };
 
-    let oauth_keypair = {
-        let map = OAUTH_TOKENS.lock().unwrap();
-        map.get(&oauth_token).unwrap().clone()
+    let oauth_keypair = match get_oauth_keypair(&oauth_token) {
+        Ok(x) => x,
+        Err(e) => panic!(),
+        // return futures01::future::Either::A(futures01::failed(e)),
     };
-    println!("OAUTH_KEYPAIR: {:?}", oauth_keypair);
 
-    // FIXME: need to get the keypair from redirect_to_twitter_authenticate
     let fut = egg_mode_2::access_token(
         &CONSUMER_TOKEN,
         &oauth_keypair,
         oauth_verifier,
         &CLIENT_POOL,
     )
+    .compat()
     .and_then(|(access_token, user_id)| {
-        println!("GOT ACCESS TOKEN");
-
         egg_mode_2::get_owners_of_first_75_lists(
             user_id,
             &CONSUMER_TOKEN,
             &access_token,
             &CLIENT_POOL,
         )
-        .map(|lists| {
-            let mut context = Context::new();
-            context.insert("list_count", &Value::String(lists.len().to_string()));
-            context.insert("removal_url", &Value::String("foo.com".to_owned()));
-            let response = Response::new(http_service::Body::from(
-                TERA.render("logged_in.html", &context).unwrap(),
-            ));
-            response
-        })
+        .compat()
+        .map_ok(|lists| logged_in_response(lists.len(), "foo.com").unwrap())
     });
-    futures01::future::Either::B(fut)
+    fut
 }
 
 fn or_internal_service_error<T>(

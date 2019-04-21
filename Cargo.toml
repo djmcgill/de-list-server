@@ -3,7 +3,7 @@ name = "de-list-server"
 version = "0.1.0"
 authors = ["David McGillicuddy <contact@djmcgill.co.uk>"]
 edition = "2018"
-licence = "MIT"
+license = "MIT"
 
 [dependencies]
 hyper = "0.12"
